@@ -7,3 +7,5 @@ Here is the link to the folder containing the data files:
 https://drive.google.com/drive/folders/1vbyZ-KhBOiYiO1HYJ4jrw4PXHgUuz8or?usp=sharing
 
 In addition, I have included a PDF file that is what the output of the EAGLE.rmd should look like.
+
+Here is a link to the shiny app for EAGLE as well: https://jmould77.shinyapps.io/EAGLE/
