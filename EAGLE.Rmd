@@ -1,0 +1,1456 @@
+---
+title: "Plate Discipline"
+author: "Joshua Mould"
+date: "2/28/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Quantifying MLB Hitter Plate Discipline
+
+Import Necessary Packages
+```{r setup, include=FALSE}
+
+
+#install.packages("pacman")
+
+pacman::p_load(tidyverse, modelr, baseballr, gam, randomForest, caret, xgboost, mlr, ggthemes, e1071, remotes, formatR, Boruta, stringi)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60), tidy=TRUE)
+options(scipen = 999)
+
+
+GetAUC <- function(model, data, Target){
+library(pacman)
+p_load(ROCR)
+
+pred <- predict(model, type="response")
+  prediction <- prediction(pred, Target)
+  Perf <- performance(prediction, "auc")
+  return(as.numeric(Perf@y.values[1]))
+
+}
+```
+
+
+Import MLB 2019 and 2020 pitch by pitch data
+```{r}
+hit_data <- readRDS("MLB Pitches 2019-2020.rds")
+pitchers_2019 <- readRDS("Statcast Pitchers Pitch Data 2019.rds")
+pitchers_2020 <- readRDS("Statcast Pitchers Pitch Data 2020.rds")
+pitchers <- rbind(pitchers_2019, pitchers_2020)
+pitchers <- pitchers %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+hit_data <- hit_data %>% left_join(pitchers, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+
+
+hit_data <- hit_data %>% select(-spin_dir, -spin_rate_deprecated, -break_angle_deprecated, -break_length_deprecated, -tfs_deprecated, -tfs_zulu_deprecated, -fielder_2, -umpire, -vx0, -vy0, -vz0, -ax, -ay, -az, -pitcher_1, -fielder_2_1, -fielder_3, -fielder_4, -fielder_5, -fielder_6, -fielder_7, -fielder_8, -fielder_9, -if_fielding_alignment, -of_fielding_alignment)
+```
+
+Add run expectancy metrics 
+```{r}
+hit_data <- hit_data %>% run_expectancy_code(level = "pitch")
+hit_data$description <- as.factor(hit_data$description)
+```
+
+## Ball/Strike Model
+Fit a glm model to determine balls and strikes
+```{r}
+
+takes <- hit_data %>% filter(description == "ball" | description == "called_strike", !is.na(plate_x) & !is.na(plate_z)) %>% mutate(strike = ifelse(description == "called_strike", 1, 0),
+         plate_x2 = plate_x^2, 
+         plate_z2 = plate_z^2,
+         plate_x3 = plate_x2 * plate_x, 
+         plate_z3 = plate_z2 * plate_z,
+         plate_xz = plate_x * plate_z,
+         plate_x2z = plate_x^2 * plate_z,
+         plate_xz2 = plate_x * plate_z^2)
+
+set.seed(7777777)
+train_takes <- takes %>% select(plate_x, plate_z, sz_top, sz_bot, strike)
+train_lab <- takes$strike
+
+xgb.train_takes = xgb.DMatrix(data = as.matrix(train_takes[, -5]), label = train_lab)
+
+
+
+##### Model
+params <- list(objective = "binary:logistic", eta = .3, eval_metric = "auc")
+
+
+strike_prob_mod <- xgb.train(params = params, data = xgb.train_takes, nrounds = 100, watchlist = list(val=xgb.train_takes))
+strike_prob_mod
+
+#strike_prob_model <- glm(strike ~ plate_x + plate_z + plate_x2 + plate_z2 + plate_xz + sz_top + sz_bot, data = takes, family = binomial(link = "logit"))
+
+#summary(strike_prob_model)
+
+#takes %>% add_predictions(strike_prob_mod, type = "response")
+strike_prob_preds <- predict(strike_prob_mod, xgb.train_takes, reshape = T)
+
+takes <- takes %>% bind_cols(strike_prob_preds)
+max(strike_prob_mod$evaluation_log$train_auc)
+#GetAUC(strike_prob_mod, takes, takes$strike)
+#takes %>% select(strike, plate_x, plate_z, plate_x2,  plate_z2, plate_x3, plate_z3, plate_xz, plate_x2z, plate_xz2) %>% cor()
+
+
+```
+
+Create a strike heatmap to see the accuracy of the logistic model
+```{r}
+x <- seq(-1.5, 1.5, length.out=100)
+y <- seq(0.5, 5, length.out=100)
+preds <- data.frame(plate_x = c(outer(x, y * 0 + 1)), plate_z = c(outer(x * 0 + 1, y)), sz_top = mean(hit_data$sz_top, na.rm = T), sz_bot =mean(hit_data$sz_bot, na.rm = T))
+
+#preds <- preds %>% mutate(plate_x2 = plate_x^2, plate_z2 = plate_z^2,
+ #        plate_x3 = plate_x2 * plate_x, plate_z3 = plate_z2 * plate_z,
+  #       plate_xz = plate_x * plate_z,
+   #      plate_x2z = plate_x^2 * plate_z,
+    #     plate_xz2 = plate_x * plate_z^2) %>% add_predictions(strike_prob_model) %>% mutate(strike_prob = 1/(1+exp(-1*pred)))
+
+#strike_predictions <- predict(strike_prob_model, type="response", newdata = preds)
+#preds <- preds %>% add_column(strike_predictions)
+
+zone_preds <- xgb.DMatrix(data = as.matrix(preds))
+
+strikezone_preds <- predict(strike_prob_mod, zone_preds, reshape = T)
+strikezone_preds <- as.data.frame(strikezone_preds)
+preds <- preds %>% bind_cols(strikezone_preds)
+
+topKzone <- mean(hit_data$sz_top, na.rm = T)
+botKzone <- mean(hit_data$sz_bot, na.rm = T)
+inKzone <- -0.84
+outKzone <- 0.84
+kZone <- data.frame(
+  x=c(inKzone, inKzone, outKzone, outKzone, inKzone),
+  y=c(botKzone, topKzone, topKzone, botKzone, botKzone))
+
+# construct the plot
+
+ggplot(kZone, aes(x, y)) +
+    geom_tile(data=preds, 
+              aes(x=plate_x, y=plate_z, fill= strikezone_preds)) +
+    scale_fill_distiller(palette = "Spectral") +
+    geom_path(lwd=1.5, col="black") +
+    coord_fixed() +
+    ggtitle("Ball vs Strike") +
+  labs(fill = "Strike Probability", y = "", x = "") +
+  theme(axis.title.y = element_text(angle = 0, vjust = .5, hjust= .5))
+
+
+```
+
+
+Logic for run expectancy ball and strike data frames, create run expectancy states for next possible outcomes (ball/strike) based on current situations.
+```{r}
+takes$pitch_id <- seq(1, nrow(takes))
+
+ball_next <- takes
+ball_next <- ball_next %>% mutate(balls_new = ifelse(balls < 3, balls + 1, 0), 
+                                  strikes_new = ifelse(balls < 3, strikes, 0), 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = ifelse(balls == 3 & is.na(on_1b), 1, on_1b), 
+                                  on_2b_new = ifelse(balls == 3 & !is.na(on_1b), 1, on_2b), 
+                                  on_3b_new = ifelse(balls == 3 & !is.na(on_1b) & !is.na(on_2b), 1, on_3b)) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+ball_next <- ball_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+strike_next <- takes
+strike_next <- strike_next %>% mutate(balls_new = ifelse(strikes < 2, balls, 0), 
+                                  strikes_new = ifelse(strikes < 2, strikes + 1, 0), 
+                                  outs_when_up_new = ifelse(strikes < 2, outs_when_up, outs_when_up + 1), 
+                                  on_1b_new =  on_1b, 
+                                  on_2b_new = on_2b, 
+                                  on_3b_new = on_3b) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+strike_next <- strike_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+strike_next[which(strike_next$outs_when_up_new == 3), "avg_re.y"] <- 0
+
+```
+
+Combine the resulting data frames and calculate strike probability
+```{r}
+takes_ball <- ball_next %>% 
+  select(pitch_id, balls_new, strikes_new, outs_when_up_new, on_1b_new, on_2b_new, on_3b_new, count_base_out_state_new, avg_re.y) %>% 
+  rename(count_base_out_state_ball = count_base_out_state_new, avg_re.ball = avg_re.y)
+
+take_outcomes <- strike_next %>% 
+  rename(count_base_out_state_orig = count_base_out_state, count_base_out_state_strike = count_base_out_state_new, avg_re.orig = avg_re.x, avg_re.strike = avg_re.y) %>% left_join(takes_ball, by = "pitch_id")
+
+takes <- take_outcomes %>% select(plate_x, plate_z, sz_top, sz_bot)
+
+xgb_takes <- xgb.DMatrix(data = as.matrix(takes))
+
+takes_preds <- predict(strike_prob_mod, xgb_takes, reshape = T)
+takes_preds <- as.data.frame(takes_preds)
+
+take_outcomes <- take_outcomes %>% bind_cols(takes_preds) %>% rename(strike_prob = takes_preds)
+#take_outcomes <- take_outcomes %>% add_predictions(strike_prob_mod, var = "strike_prob", type = "response")
+
+```
+
+
+Create variable with the run expectancy total for taking a pitch
+```{r}
+
+take_outcomes <- take_outcomes %>% mutate(re_take = avg_re.ball * (1 - strike_prob) - avg_re.strike * strike_prob)
+
+
+take_outcomes %>% select(plate_x, plate_z, balls, strikes, on_1b, on_2b, on_3b, strike_prob, avg_re.strike, avg_re.ball, re_take) %>% arrange(re_take) %>% head()
+
+
+```
+
+
+## Build xgboost Multi-Classification Probability Model
+Use statcast data for creating metrics for players with the swings dataset to be used in the classification model. 
+```{r, echo = F, results=F, warning=FALSE}
+
+basic_batter_stats <- daily_batter_bref("2019-03-20", "2020-09-27")
+
+## merge to data 
+hit_data <- hit_data %>% inner_join(basic_batter_stats, by = c("player_name" = "Name"))
+
+hit_data <- hit_data %>% mutate(barrel = ifelse(launch_angle <= 50 & launch_speed >= 98 & launch_speed * 1.5 - launch_angle >= 117 & launch_speed + launch_angle >= 124, 1, 0))
+
+
+# Fix character columns
+hit_data[which(hit_data$launch_speed_angle == "null"),"launch_speed_angle"] <- NA
+hit_data[which(hit_data$estimated_ba_using_speedangle == "null"), "estimated_ba_using_speedangle"] <- NA
+hit_data[which(hit_data$estimated_woba_using_speedangle == "null"), "estimated_woba_using_speedangle"] <- NA
+hit_data[which(hit_data$woba_value == "null"), "woba_value"] <- NA
+hit_data[which(hit_data$iso_value == "null"), "iso_value"] <- NA
+
+hit_data$launch_speed_angle <- as.numeric(hit_data$launch_speed_angle)
+hit_data$estimated_ba_using_speedangle <- as.numeric(hit_data$estimated_ba_using_speedangle)
+hit_data$estimated_woba_using_speedangle <- as.numeric(hit_data$estimated_woba_using_speedangle)
+hit_data$woba_value <- as.numeric(hit_data$woba_value)
+hit_data$iso_value <- as.numeric(hit_data$iso_value)
+
+
+grouped_stats <- hit_data %>% group_by(player_name, zone) %>% summarise(barrel_perc = mean(barrel, na.rm = T), avg_launch_angle = mean(launch_angle, na.rm = T), avg_exit_velocity = mean(launch_speed, na.rm = T), avg_launch_speed_angle = mean(launch_speed_angle, na.rm = T), xAVG = mean(estimated_ba_using_speedangle, na.rm = T), xwOBA = mean(estimated_woba_using_speedangle, na.rm = T), wOBA = mean(woba_value, na.rm = T), ISO = mean(iso_value, na.rm = T))
+
+
+hit_data <- hit_data %>% inner_join(grouped_stats, by = c("player_name", "zone"))
+
+hit_data <- hit_data %>% separate(pitcher_name, into = c("last_name", "first_name"), sep = ", ") %>% mutate(pitcher_name = paste(first_name, last_name, sep = " "))
+
+basic_pitcher_stats <- daily_pitcher_bref("2019-03-20", "2020-09-27")
+
+basic_pitcher_stats$bbref_id <- as.numeric(basic_pitcher_stats$bbref_id)
+
+hit_data <- hit_data %>% inner_join(basic_pitcher_stats, by = c("pitcher_name" = "Name"))
+
+grouped_pitching_stats <- hit_data %>% group_by(pitcher_name) %>% summarise(FF_spin_rate = mean(release_spin_rate[pitch_type == "FF"], na.rm = T), CU_spin_rate = mean(release_spin_rate[pitch_type == "CU"], na.rm = T), FF_velocity = mean(release_speed[pitch_type == "FF"], na.rm = T), BRK_velocity = mean(release_speed[pitch_type == "CU" | pitch_type == "SL"], na.rm = T), overall_spin_rate = mean(release_spin_rate, na.rm = T), overall_velocity = mean(release_speed, na.rm = T))
+
+hit_data <- hit_data %>% inner_join(grouped_pitching_stats, by = "pitcher_name")
+```
+
+
+
+
+Now prep for classification model with outcome column addition.
+```{r}
+hit_data <- hit_data %>% mutate(on_1b = ifelse(!is.na(on_1b), 1, 0), on_2b = ifelse(!is.na(on_2b), 1, 0), on_3b = ifelse(!is.na(on_3b), 1, 0))
+
+
+hit_data <- hit_data %>% mutate(outcome = ifelse(description == "swinging_strike" | description == "swinging_strike_blocked" | description == "foul_tip" | (strikes == 2 & description == "foul_bunt") | description == "bunt_foul_tip" | description == "missed_bunt", "Miss", ifelse(description == "foul" | description == "foul_bunt", "Foul", ifelse(events == "single", "Single", ifelse(events == "double", "Double", ifelse(events == "triple", "Triple", ifelse(events == "home_run", "Homerun", "Out")))))))
+
+
+
+```
+
+
+Build classification model using xgboost to determine outcome probabilities of Miss, Foul, Out, Single, Double, Triple, and Homerun.
+```{r}
+
+swings <- hit_data %>% filter(description != "ball" & description != "called_strike" & description != "blocked_ball" & description != "pitchout" & description != "hit_by_pitch")
+
+swings <- swings %>% filter(ERA <= 20)
+
+set.seed(7777777)
+sample <- sample(1:length(swings$game_date), length(swings$game_date) * .8)
+train <- swings[sample,]
+test <- swings[-sample,]
+
+train_lab <- as.factor(train$outcome)
+test_lab <- as.factor(test$outcome)
+
+final_lab <- levels(train_lab)
+
+ 
+
+train <- train %>% select(plate_x, plate_z, pfx_x, pfx_z, pitch_type, balls, strikes, outs_when_up, release_spin_rate, stand, p_throws, effective_speed, release_speed, PA, BA, OBP, SLG, barrel_perc, avg_exit_velocity, avg_launch_angle, xAVG, xwOBA, wOBA, ISO, IP, ERA, GB.FB, WHIP, SO_perc, uBB_perc, overall_spin_rate, overall_velocity, outcome)
+
+
+
+test <- test %>% select(plate_x, plate_z, pfx_x, pfx_z, pitch_type, balls, strikes, outs_when_up, release_spin_rate, stand, p_throws, effective_speed, release_speed, PA, BA, OBP, SLG, barrel_perc, avg_exit_velocity, avg_launch_angle, xAVG, xwOBA, wOBA, ISO, IP, ERA, GB.FB, WHIP, SO_perc, uBB_perc, overall_spin_rate, overall_velocity, outcome)
+
+
+train$pitch_type <- as.numeric(as.factor(train$pitch_type)) - 1
+train$p_throws <- as.numeric(as.factor(train$p_throws)) - 1
+train$stand <- as.numeric(as.factor(train$stand)) - 1
+
+
+test$pitch_type <- as.numeric(as.factor(test$pitch_type)) - 1
+test$p_throws <- as.numeric(as.factor(test$p_throws)) - 1
+test$stand <- as.numeric(as.factor(test$stand)) - 1
+
+# Use boruta to determine important variables
+# Perform Boruta search
+# boruta_train <- na.omit(train)
+# outcome <- as.factor(boruta_train[,'outcome']$outcome)
+# boruta_output <- Boruta(y = outcome, x = boruta_train[-33], doTrace=0) 
+# boruta_signif <- getSelectedAttributes(boruta_output, withTentative = TRUE)
+# print(boruta_signif)  
+# 
+# plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Variable Importance") 
+# ###
+
+train_lab <- as.numeric(as.factor(train_lab))-1
+test_lab <- as.numeric(as.factor(test_lab))-1
+
+
+xgb.train = xgb.DMatrix(data = as.matrix(train[, -33]), label = train_lab)
+xgb.test = xgb.DMatrix(data = as.matrix(test[, -33]), label = test_lab)
+
+
+##### Model
+params <- list(objective = "multi:softprob", num_class = 7, eta = .3, min_child_weight = 6.47, max_depth = 9, subsample = .837, colsample_bytree = .75, eval_metric = "merror")
+
+
+swing_mod <- xgb.train(params = params, data = xgb.train, nrounds = 49)
+swing_mod
+```
+
+
+Remove unnecessary variables
+```{r}
+remove(ball_next, basic_batter_stats, basic_pitcher_stats, grouped_pitching_stats, grouped_stats, pitchers, pitchers_2019, pitchers_2020, run_expectancy_state_table, strike_next, takes_ball)
+
+remove(train, test, takes, take_outcomes, swings)
+```
+
+
+Don't run this chunk, this is for the optimization of the parameters on the xgboost model which has already been done
+```{r, eval = FALSE}
+# Use built in cv to determine best value for nrounds
+xgbcv <- xgb.cv(params = params, data = xgb.train, nrounds = 100, nfold = 5, showsd = T, stratified = T, print.every.n = 10, early.stop.round = 20, maximize = F)
+##best iteration = 49
+
+min(xgbcv$evaluation_log$train_merror_mean)
+# Min error is  0.3959454
+
+xgb.importance(feature_names = colnames(train),model = swing_mod)
+
+
+#convert characters to factors
+fact_col <- colnames(train)[sapply(train, is.character)]
+
+
+train <- train[which(!is.na(train$barrel_perc)),]
+train <- train[which(!is.na(train$xAVG)),]
+train <- train[which(!is.na(train$ERA) & is.finite(train$ERA)),]
+train <- train[which(!is.na(train$overall_spin_rate)),]
+
+test <- test[which(!is.na(test$barrel_perc)),]
+test <- test[which(!is.na(test$xAVG)),]
+test <- test[which(!is.na(test$ERA) & is.finite(test$ERA)),]
+test <- test[which(!is.na(test$overall_spin_rate)),]
+
+#create tasks
+traintask <- makeClassifTask(data = train, target = "outcome")
+testtask <- makeClassifTask(data = test, target = "outcome")
+
+#do one hot encoding`<br/> 
+traintask <- createDummyFeatures (obj = traintask) 
+testtask <- createDummyFeatures (obj = testtask)
+
+#create learner
+lrn <- makeLearner("classif.xgboost",predict.type = "response")
+lrn$par.vals <- list( objective="multi:softprob", eval_metric="merror", nrounds=100L, eta=0.1)
+
+#set parameter space
+params <- makeParamSet( makeDiscreteParam("booster",values = c("gbtree","gblinear")), makeIntegerParam("max_depth",lower = 3L,upper = 10L), makeNumericParam("min_child_weight",lower = 1L,upper = 10L), makeNumericParam("subsample",lower = 0.5,upper = 1), makeNumericParam("colsample_bytree",lower = 0.5,upper = 1))
+
+#set resampling strategy
+rdesc <- makeResampleDesc("CV",stratify = T,iters=5L)
+
+#search strategy
+ctrl <- makeTuneControlRandom(maxit = 10L)
+
+#set parallel backend
+library(parallel)
+library(parallelMap) 
+parallelStartSocket(cpus = detectCores())
+
+#parameter tuning
+mytune <- tuneParams(learner = lrn, task = traintask, resampling = rdesc, measures = acc, par.set = params, control = ctrl, show.info = T)
+mytune
+mytune$y 
+#0.4584903
+
+#set hyperparameters
+lrn_tune <- setHyperPars(lrn,par.vals = mytune$x)
+
+#train model
+xgmodel <- train(learner = lrn_tune,task = traintask)
+
+
+#predict model
+xgpred <- predict(xgmodel,testtask, type="response")
+
+confusionMatrix(xgpred$data$response,xgpred$data$truth)
+#Accuracy : 0.4609
+
+########
+xgb.pred = predict(swing_mod, xgb.test, reshape=T)
+xgb.pred = as.data.frame(xgb.pred)
+xgb.pred$label <- test$outcome
+names(xgb.pred) <- levels(test$outcome)
+
+
+# Use the predicted label with the highest probability
+#xgb.pred$prediction = apply(xgb.pred,1,function(x) colnames(xgb.pred)[which.max(x)])
+xgb.pred$label = swings$outcome[-sample]
+colnames(xgb.pred)[1:7] <- final_lab
+
+table(xgb.pred$label)
+
+
+
+xgb.pred %>% group_by(label) %>% summarize(meanMiss = mean(Miss), 
+                                           meanOut = mean(Out), 
+                                           meanSingle = mean(Single), 
+                                           meanDouble = mean(Double),
+                                           meanTriple = mean(Triple),
+                                           meanHR = mean(Homerun), 
+                                           meanFoul = mean(Foul))
+quantile(xgb.pred$Homerun, 0.99)
+xgb.pred %>% filter(xgb.pred$Homerun > 0.075) %>% select(label) %>% table() %>% prop.table()
+xgb.pred %>% select(label)%>% table() %>% prop.table()
+
+#Check out results
+
+xgb.pred %>% arrange(-Double)
+
+```
+
+Predict Delta Run Expectancy
+```{r}
+# get training set ready
+
+
+dre_train <- hit_data %>% filter(PA >= 150) %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS, change_re) %>% na.omit()
+
+train_lab <- dre_train$change_re
+
+xgb.train_dre = xgb.DMatrix(data = as.matrix(dre_train[, -8]), label = train_lab)
+
+##### Model
+#params <- list(objective = "reg:", num_class = 7, eta = .3, min_child_weight = 6.47, max_depth = 9, subsample = .837, colsample_bytree = .75, eval_metric = "merror")
+
+
+dre_mod <- xgb.train(data = xgb.train_dre, nrounds = 100, watchlist = list(train=xgb.train_dre))
+dre_mod
+
+#mean(all_years$change_re)
+```
+
+
+Look at results
+```{r}
+dre_train <- hit_data %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS) 
+
+
+
+xgb.train_dre = xgb.DMatrix(data = as.matrix(dre_train))
+
+
+dre_preds <- predict(dre_mod, xgb.train_dre)
+dre_preds <- as.data.frame(dre_preds)
+
+hit_data <- hit_data %>% bind_cols(dre_preds)
+
+hit_data %>% select(change_re, dre_preds, balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+hit_data %>% filter(player_name == "Mike Trout", balls == 0, strikes == 0, outs_when_up == 0, on_1b == 1, on_2b == 0, on_3b == 0) %>% select(change_re, dre_preds, balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS, PA)
+
+hit_data %>% filter(player_name == "Jackie Bradley Jr.", balls == 0, strikes == 0, outs_when_up == 0, on_1b == 1, on_2b == 0, on_3b == 0) %>% select(change_re, dre_preds, balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS, PA)
+
+
+hit_data %>%
+  group_by(player_name, season.x) %>% 
+  summarize(dre = mean(dre_preds, na.rm = T), dre_actual = mean(change_re, na.rm = T), PA = first(PA), OPS = first(OPS)) %>% 
+  arrange(-dre) %>% 
+  filter(PA >= 200) %>% 
+  ggplot(aes(dre, OPS)) + 
+  geom_point() + 
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between predicted DRE and OPS", 
+       subtitle = "2019-2020") +
+  xlab("xDRE") +
+  ylab("OPS")
+```
+
+
+
+## Test EAGLE on all pitches from years 2016-2019
+Import data for each year and merge pitching data with hitting data.
+```{r}
+pitches_2016 <- read_rds("MLB Pitches 2016.rds")
+pitches_2017 <- read_rds("MLB Pitches 2017.rds")
+pitches_2018 <- read_rds("MLB Pitches 2018.rds")
+pitches_2019 <- read_rds("MLB Pitches 2019.rds")
+pitches_2020 <- read_rds("Statcast Batters Data 2020.rds")
+
+
+pitches_2021 <- read_rds("MLB Pitches 2021.rds")
+
+pitchers_2016 <- readRDS("Statcast Pitchers Pitch Data 2016.rds")
+pitchers_2017 <- readRDS("Statcast Pitchers Pitch Data 2017.rds")
+pitchers_2018 <- readRDS("Statcast Pitchers Pitch Data 2018.rds")
+pitchers_2019 <- readRDS("Statcast Pitchers Pitch Data 2019.rds")
+pitchers_2020 <- readRDS("Statcast Pitchers Data 2020.rds")
+
+pitchers_2021 <- readRDS("Statcast Pitchers Data 2021.rds")
+
+pitchers_2016 <- pitchers_2016 %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+pitches_2016 <- pitches_2016 %>% left_join(pitchers_2016, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+pitchers_2017 <- pitchers_2017 %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+pitches_2017 <- pitches_2017 %>% left_join(pitchers_2017, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+pitchers_2018 <- pitchers_2018 %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+pitches_2018 <- pitches_2018 %>% left_join(pitchers_2018, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+pitchers_2019 <- pitchers_2019 %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+pitches_2019 <- pitches_2019 %>% left_join(pitchers_2019, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+pitchers_2020 <- pitchers_2020 %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+pitches_2020 <- pitches_2020 %>% left_join(pitchers_2020, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+pitchers_2021 <- pitchers_2021 %>% select(game_pk, at_bat_number, pitch_number, player_name) %>% rename(pitcher_name = player_name)
+pitches_2021 <- pitches_2021 %>% left_join(pitchers_2021, by = c("game_pk", "at_bat_number", "pitch_number"))
+
+remove(pitchers_2016, pitchers_2017, pitchers_2018, pitchers_2019, pitchers_2020, pitchers_2021)
+
+```
+
+pitches_2017, startdate = "2017-04-02", enddate = "2017-10-01"
+Make function to apply predictions from models and create EAGLE
+```{r}
+
+#pitch_df <- pitches_2017
+#startdate = "2017-04-02"
+#enddate = "2017-10-01"
+
+#remove(pitch_df, startdate, enddate)
+
+
+apply_EAGLE <- function(pitch_df, startdate, enddate){
+  
+  hit_data <- pitch_df
+  startdate <- as.Date(startdate)
+  enddate <- as.Date(enddate)
+  
+# Remove accents from player names
+  hit_data$player_name <- stri_trans_general(hit_data$player_name, "Latin-ASCII")
+  hit_data$pitcher_name <- stri_trans_general(hit_data$pitcher_name, "Latin-ASCII")
+  
+hit_data <- hit_data %>% run_expectancy_code(level = "pitch")
+hit_data$description <- as.factor(hit_data$description)
+
+########
+## merge to data 
+
+basic_batter_stats <- daily_batter_bref(startdate, enddate)
+
+basic_batter_stats$bbref_id <- as.numeric(basic_batter_stats$bbref_id)
+
+hit_data <- hit_data %>% separate(player_name, into = c("Last", "First"), sep = ", ") %>% mutate(Name = paste(First, Last))
+
+
+hit_data <- hit_data %>% inner_join(basic_batter_stats, by = c("Name"))
+
+
+
+hit_data_outcomes <- hit_data %>% mutate(barrel = ifelse(launch_angle <= 50 & launch_speed >= 98 & launch_speed * 1.5 - launch_angle >= 117 & launch_speed + launch_angle >= 124, 1, 0))
+
+
+# Fix character columns
+hit_data_outcomes[which(hit_data_outcomes$launch_speed_angle == "null"),"launch_speed_angle"] <- NA
+hit_data_outcomes[which(hit_data_outcomes$estimated_ba_using_speedangle == "null"), "estimated_ba_using_speedangle"] <- NA
+hit_data_outcomes[which(hit_data_outcomes$estimated_woba_using_speedangle == "null"), "estimated_woba_using_speedangle"] <- NA
+hit_data_outcomes[which(hit_data_outcomes$woba_value == "null"), "woba_value"] <- NA
+hit_data_outcomes[which(hit_data_outcomes$iso_value == "null"), "iso_value"] <- NA
+
+hit_data_outcomes$launch_speed_angle <- as.numeric(hit_data_outcomes$launch_speed_angle)
+hit_data_outcomes$estimated_ba_using_speedangle <- as.numeric(hit_data_outcomes$estimated_ba_using_speedangle)
+hit_data_outcomes$estimated_woba_using_speedangle <- as.numeric(hit_data_outcomes$estimated_woba_using_speedangle)
+hit_data_outcomes$woba_value <- as.numeric(hit_data_outcomes$woba_value)
+hit_data_outcomes$iso_value <- as.numeric(hit_data_outcomes$iso_value)
+
+
+grouped_stats <- hit_data_outcomes %>% group_by(batter, zone) %>% summarise(barrel_perc = mean(barrel, na.rm = T), avg_launch_angle = mean(launch_angle, na.rm = T), avg_exit_velocity = mean(launch_speed, na.rm = T), xAVG = mean(estimated_ba_using_speedangle, na.rm = T), xwOBA = mean(estimated_woba_using_speedangle, na.rm = T), wOBA = mean(woba_value, na.rm = T), ISO = mean(iso_value, na.rm = T))
+
+
+
+
+hit_data_outcomes <- hit_data_outcomes %>% inner_join(grouped_stats, by = c("batter", "zone"))
+
+hit_data_outcomes <- hit_data_outcomes %>% separate(pitcher_name, into = c("last_name", "first_name"), sep = ", ") %>% mutate(pitcher_name = paste(first_name, last_name, sep = " "))
+
+basic_pitcher_stats <- daily_pitcher_bref(startdate, enddate)
+
+basic_pitcher_stats$bbref_id <- as.numeric(basic_pitcher_stats$bbref_id)
+
+hit_data_outcomes <- hit_data_outcomes %>% inner_join(basic_pitcher_stats, by = c("pitcher_name" = "Name"))
+
+grouped_pitching_stats <- hit_data_outcomes %>% group_by(pitcher) %>% summarise(overall_spin_rate = mean(release_spin_rate, na.rm = T), overall_velocity = mean(release_speed, na.rm = T))
+
+
+hit_data <- hit_data_outcomes %>% inner_join(grouped_pitching_stats, by = "pitcher")
+
+hit_data$pitch_id <- seq(1, nrow(hit_data))
+hit_data_outcomes$pitch_id <- seq(1, nrow(hit_data_outcomes))
+
+hit_data <- hit_data %>% select(-c(G.x, AB.x, R.x, H.x, X1B.x, X2B.x, X3B.x, HR.x, RBI, IBB.x, uBB.x, HBP.x, SH, SF.x, GDP.x, SB.x, CS.x, G.y, GS, W, L, SV, H.y, R.y, ER, uBB.y, BB.y, SO.y, HR.y, HBP.y,  X1B.y, X2B.y, X3B.y, IBB.y, GDP.y, SF.y, SB.y, CS.y, PO, BF, Pit, Str, StL, StS, LD, PU, BAbip, SO9, SO.W, SO_uBB ))
+########
+
+ball_next <- hit_data
+ball_next <- ball_next %>% mutate(balls_new = ifelse(balls < 3, balls + 1, 0), 
+                                  strikes_new = ifelse(balls < 3, strikes, 0), 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = ifelse(balls == 3 & is.na(on_1b), 1, on_1b), 
+                                  on_2b_new = ifelse(balls == 3 & !is.na(on_1b), 1, on_2b), 
+                                  on_3b_new = ifelse(balls == 3 & !is.na(on_1b) & !is.na(on_2b), 1, on_3b)) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+ball_next <- ball_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+
+strike_next <- hit_data
+strike_next <- strike_next %>% mutate(balls_new = ifelse(strikes < 2, balls, 0), 
+                                  strikes_new = ifelse(strikes < 2, strikes + 1, 0), 
+                                  outs_when_up_new = ifelse(strikes < 2, outs_when_up, outs_when_up + 1), 
+                                  on_1b_new =  on_1b, 
+                                  on_2b_new = on_2b, 
+                                  on_3b_new = on_3b) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+strike_next <- strike_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+strike_next[which(strike_next$outs_when_up_new == 3), "avg_re.y"] <- 0
+
+
+
+### APPLY DRE for ball
+dre_ball_orig <- ball_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.ball_orig = xgb.DMatrix(data = as.matrix(dre_ball_orig))
+
+dre_ball_preds <- predict(dre_mod, xgb.ball_orig)
+dre_ball_preds <- as.data.frame(dre_ball_preds)
+
+ball_next <- ball_next %>% bind_cols(dre_ball_preds) 
+ball_next <- ball_next %>% rename(dre_ball_orig_preds = dre_ball_preds) %>% mutate(avg_re.x = avg_re.x + dre_ball_orig_preds)
+
+### APPLY DRE for ball next
+dre_ball_next <- ball_next %>% select(balls_new, strikes_new, outs_when_up_new, on_1b_new, on_2b_new, on_3b_new, OPS) %>% rename(balls = balls_new, strikes = strikes_new, outs_when_up = outs_when_up_new, on_1b = on_1b_new, on_2b = on_2b_new, on_3b = on_3b_new) 
+
+xgb.ball_next = xgb.DMatrix(data = as.matrix(dre_ball_next))
+
+dre_ball_preds <- predict(dre_mod, xgb.ball_next)
+dre_ball_preds <- as.data.frame(dre_ball_preds)
+
+ball_next <- ball_next %>% bind_cols(dre_ball_preds) %>% rename(dre_ball_next_preds = dre_ball_preds) %>% mutate(avg_re.y = ifelse(balls == 3, avg_re.y, avg_re.y + dre_ball_next_preds))
+
+##### Apply for strikes
+
+### APPLY DRE for strike
+dre_strike_orig <- strike_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.strike_orig = xgb.DMatrix(data = as.matrix(dre_strike_orig))
+
+dre_strike_preds <- predict(dre_mod, xgb.strike_orig)
+dre_strike_preds <- as.data.frame(dre_strike_preds)
+
+strike_next <- strike_next %>% bind_cols(dre_strike_preds) %>% rename(dre_strike_orig_preds = dre_strike_preds) %>% mutate(avg_re.x = avg_re.x + dre_strike_orig_preds)
+
+### APPLY DRE for strike next
+dre_strike_next <- strike_next %>% select(balls_new, strikes_new, outs_when_up_new, on_1b_new, on_2b_new, on_3b_new, OPS) %>% rename(balls = balls_new, strikes = strikes_new, outs_when_up = outs_when_up_new, on_1b = on_1b_new, on_2b = on_2b_new, on_3b = on_3b_new) 
+
+xgb.strike_next = xgb.DMatrix(data = as.matrix(dre_strike_next))
+
+dre_strike_preds <- predict(dre_mod, xgb.strike_next)
+dre_strike_preds <- as.data.frame(dre_strike_preds)
+
+strike_next <- strike_next %>% bind_cols(dre_strike_preds) %>% rename(dre_strike_next_preds = dre_strike_preds) %>% mutate(avg_re.y = ifelse(strikes == 2, avg_re.y, avg_re.y + dre_strike_next_preds))
+
+
+#####
+hit_data_ball <- ball_next %>% mutate(avg_re.ball = avg_re.y - avg_re.x) %>%
+  select(pitch_id, count_base_out_state_new, avg_re.ball) %>% 
+  rename(count_base_out_state_ball = count_base_out_state_new)
+
+hit_data_outcomes <- strike_next %>% mutate(avg_re.strike = avg_re.y - avg_re.x) %>%
+  rename(count_base_out_state_orig = count_base_out_state, count_base_out_state_strike = count_base_out_state_new, avg_re.orig = avg_re.x) %>% left_join(hit_data_ball, by = "pitch_id")
+
+
+
+#hit_data_outcomes <- hit_data_outcomes %>% mutate(plate_x2 = plate_x^2, plate_z2 = plate_z^2,
+         # plate_x3 = plate_x2 * plate_x, plate_z3 = plate_z2 * plate_z,
+         # plate_xz = plate_x * plate_z,
+         # plate_x2z = plate_x^2 * plate_z,
+         # plate_xz2 = plate_x * plate_z^2)
+
+#hit_data_outcomes <- hit_data_outcomes %>% add_predictions(strike_prob_model, var = "strike_prob", type = "response")
+
+takes <- hit_data_outcomes %>% select(plate_x, plate_z, sz_top, sz_bot)
+
+xgb_takes <- xgb.DMatrix(data = as.matrix(takes))
+
+takes_preds <- predict(strike_prob_mod, xgb_takes, reshape = T)
+takes_preds <- as.data.frame(takes_preds)
+
+hit_data_outcomes <- hit_data_outcomes %>% bind_cols(takes_preds) %>% rename(strike_prob = takes_preds)
+
+
+
+########
+
+
+
+###### Misses
+miss_next <- hit_data
+miss_next <- miss_next %>% mutate(balls_new = ifelse(strikes < 2, balls, 0), 
+                                  strikes_new = ifelse(strikes < 2, strikes + 1, 0), 
+                                  outs_when_up_new = ifelse(strikes < 2, outs_when_up, outs_when_up + 1), 
+                                  on_1b_new = on_1b, 
+                                  on_2b_new = on_2b, 
+                                  on_3b_new = on_3b) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+miss_next <- miss_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+miss_next[which(miss_next$outs_when_up_new == 3), "avg_re.y"] <- 0
+
+### APPLY DRE for miss
+dre_miss_orig <- miss_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.miss_orig = xgb.DMatrix(data = as.matrix(dre_miss_orig))
+
+dre_miss_preds <- predict(dre_mod, xgb.miss_orig)
+dre_miss_preds <- as.data.frame(dre_miss_preds)
+
+miss_next <- miss_next %>% bind_cols(dre_miss_preds) %>% rename(dre_miss_orig_preds = dre_miss_preds) %>% mutate(avg_re.x = avg_re.x + dre_miss_orig_preds)
+
+### APPLY DRE for miss next
+dre_miss_next <- miss_next %>% select(balls_new, strikes_new, outs_when_up_new, on_1b_new, on_2b_new, on_3b_new, OPS) %>% rename(balls = balls_new, strikes = strikes_new, outs_when_up = outs_when_up_new, on_1b = on_1b_new, on_2b = on_2b_new, on_3b = on_3b_new) 
+
+xgb.miss_next = xgb.DMatrix(data = as.matrix(dre_miss_next))
+
+dre_miss_preds <- predict(dre_mod, xgb.miss_next)
+dre_miss_preds <- as.data.frame(dre_miss_preds)
+
+miss_next <- miss_next %>% bind_cols(dre_miss_preds) %>% rename(dre_miss_next_preds = dre_miss_preds) %>% mutate(avg_re.y = ifelse(strikes == 2, avg_re.y, avg_re.y + dre_miss_next_preds))
+
+###### Fouls
+
+foul_next <- hit_data
+foul_next <- foul_next %>% mutate(balls_new = balls, 
+                                  strikes_new = ifelse(strikes < 2, strikes + 1, 2), 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = on_1b, 
+                                  on_2b_new = on_2b, 
+                                  on_3b_new = on_3b) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+foul_next <- foul_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+### APPLY DRE for foul
+dre_foul_orig <- foul_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.foul_orig = xgb.DMatrix(data = as.matrix(dre_foul_orig))
+
+dre_foul_preds <- predict(dre_mod, xgb.foul_orig)
+dre_foul_preds <- as.data.frame(dre_foul_preds)
+
+foul_next <- foul_next %>% bind_cols(dre_foul_preds) %>% rename(dre_foul_orig_preds = dre_foul_preds) %>% mutate(avg_re.x = avg_re.x + dre_foul_orig_preds)
+
+### APPLY DRE for foul next
+dre_foul_next <- foul_next %>% select(balls_new, strikes_new, outs_when_up_new, on_1b_new, on_2b_new, on_3b_new, OPS) %>% rename(balls = balls_new, strikes = strikes_new, outs_when_up = outs_when_up_new, on_1b = on_1b_new, on_2b = on_2b_new, on_3b = on_3b_new) 
+
+xgb.foul_next = xgb.DMatrix(data = as.matrix(dre_foul_next))
+
+dre_foul_preds <- predict(dre_mod, xgb.foul_next)
+dre_foul_preds <- as.data.frame(dre_foul_preds)
+
+foul_next <- foul_next %>% bind_cols(dre_foul_preds) %>% rename(dre_foul_next_preds = dre_foul_preds) %>% mutate(avg_re.y = avg_re.y + dre_foul_next_preds)
+
+###### Outs
+
+out_next <- hit_data
+out_next <- out_next %>% mutate(balls_new = 0, 
+                                  strikes_new = 0, 
+                                  outs_when_up_new = outs_when_up + 1, 
+                                  on_1b_new = on_1b, 
+                                  on_2b_new = on_2b, 
+                                  on_3b_new = on_3b) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+out_next <- out_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+out_next[which(out_next$outs_when_up_new == 3), "avg_re.y"] <- 0
+
+### APPLY DRE for out
+dre_out_orig <- out_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.out_orig = xgb.DMatrix(data = as.matrix(dre_out_orig))
+
+dre_out_preds <- predict(dre_mod, xgb.out_orig)
+dre_out_preds <- as.data.frame(dre_out_preds)
+
+out_next <- out_next %>% bind_cols(dre_out_preds) %>% rename(dre_out_orig_preds = dre_out_preds) %>% mutate(avg_re.x = avg_re.x + dre_out_orig_preds)
+
+
+###### Single
+
+single_next <- hit_data
+single_next <- single_next %>% mutate(balls_new = 0, 
+                                  strikes_new = 0, 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = ifelse(is.na(on_1b), 1, on_1b), 
+                                  on_2b_new = ifelse(is.na(on_1b), on_1b, 1), 
+                                  on_3b_new = ifelse(is.na(on_2b), on_2b, 1)) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+single_next <- single_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+### APPLY DRE for single
+dre_single_orig <- single_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.single_orig = xgb.DMatrix(data = as.matrix(dre_single_orig))
+
+dre_single_preds <- predict(dre_mod, xgb.single_orig)
+dre_single_preds <- as.data.frame(dre_single_preds)
+
+single_next <- single_next %>% bind_cols(dre_single_preds) %>% rename(dre_single_orig_preds = dre_single_preds) %>% mutate(avg_re.x = avg_re.x + dre_single_orig_preds)
+
+####### Double
+
+double_next <- hit_data
+double_next <- double_next %>% mutate(balls_new = 0, 
+                                  strikes_new = 0, 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = NA, 
+                                  on_2b_new = 1, 
+                                  on_3b_new = ifelse(is.na(on_1b), on_1b, 1)) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+double_next <- double_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+### APPLY DRE for double
+dre_double_orig <- double_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.double_orig = xgb.DMatrix(data = as.matrix(dre_double_orig))
+
+dre_double_preds <- predict(dre_mod, xgb.double_orig)
+dre_double_preds <- as.data.frame(dre_double_preds)
+
+double_next <- double_next %>% bind_cols(dre_double_preds) %>% rename(dre_double_orig_preds = dre_double_preds) %>% mutate(avg_re.x = avg_re.x + dre_double_orig_preds)
+
+###### Triple
+triple_next <- hit_data
+triple_next <- triple_next %>% mutate(balls_new = 0, 
+                                  strikes_new = 0, 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = NA, 
+                                  on_2b_new = NA, 
+                                  on_3b_new = 1) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+triple_next <- triple_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+### APPLY DRE for triple
+dre_triple_orig <- triple_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.triple_orig = xgb.DMatrix(data = as.matrix(dre_triple_orig))
+
+dre_triple_preds <- predict(dre_mod, xgb.triple_orig)
+dre_triple_preds <- as.data.frame(dre_triple_preds)
+
+triple_next <- triple_next %>% bind_cols(dre_triple_preds) %>% rename(dre_triple_orig_preds = dre_triple_preds) %>% mutate(avg_re.x = avg_re.x + dre_triple_orig_preds)
+
+####### Homerun
+
+homerun_next <- hit_data
+homerun_next <- homerun_next %>% mutate(balls_new = 0, 
+                                  strikes_new = 0, 
+                                  outs_when_up_new = outs_when_up, 
+                                  on_1b_new = NA, 
+                                  on_2b_new = NA, 
+                                  on_3b_new = NA) %>% 
+  mutate(count_base_out_state_new = paste(balls_new, "-", strikes_new, ", ", outs_when_up_new, " outs, ", ifelse(!is.na(.$on_1b_new), "1b", "_"), ifelse(!is.na(.$on_2b_new), "2b", "_"), ifelse(!is.na(.$on_3b_new), "3b", "_")))
+# merge run exxpectancy table to new data
+homerun_next <- homerun_next %>% left_join(run_expectancy_state_table, by = c("count_base_out_state_new" = "count_base_out_state"))
+
+remove(hit_data)
+
+### APPLY DRE for homerun
+dre_homerun_orig <- homerun_next %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS)
+
+xgb.homerun_orig = xgb.DMatrix(data = as.matrix(dre_homerun_orig))
+
+dre_homerun_preds <- predict(dre_mod, xgb.homerun_orig)
+dre_homerun_preds <- as.data.frame(dre_homerun_preds)
+
+homerun_next <- homerun_next %>% bind_cols(dre_homerun_preds) %>% rename(dre_homerun_orig_preds = dre_homerun_preds) %>% mutate(avg_re.x = avg_re.x + dre_homerun_orig_preds)
+
+########
+
+
+hit_data_miss <- miss_next %>% mutate(avg_re.miss = avg_re.y - avg_re.x) %>%
+  select(pitch_id, count_base_out_state_new, avg_re.miss) %>% 
+  rename(count_base_out_state_miss = count_base_out_state_new)
+
+hit_data_foul <- foul_next %>% mutate(avg_re.foul = avg_re.y - avg_re.x) %>%
+  select(pitch_id, count_base_out_state_new, avg_re.foul) %>% 
+  rename(count_base_out_state_foul = count_base_out_state_new)
+
+hit_data_out <- out_next %>% mutate(avg_re.out = avg_re.y - avg_re.x) %>%
+  select(pitch_id, count_base_out_state_new, avg_re.out) %>% 
+  rename(count_base_out_state_out = count_base_out_state_new)
+
+hit_data_single <- single_next %>% mutate(avg_re.single = avg_re.y - avg_re.x) %>%
+  select(pitch_id,  count_base_out_state_new, avg_re.single) %>% 
+  rename(count_base_out_state_single = count_base_out_state_new)
+
+hit_data_double <- double_next %>% mutate(avg_re.double = avg_re.y - avg_re.x) %>%
+  select(pitch_id,  count_base_out_state_new, avg_re.double) %>% 
+  rename(count_base_out_state_double = count_base_out_state_new)
+
+hit_data_triple <- triple_next %>% mutate(avg_re.triple = avg_re.y - avg_re.x) %>%
+  select(pitch_id, count_base_out_state_new, avg_re.triple) %>% 
+  rename(count_base_out_state_triple = count_base_out_state_new)
+
+hit_data_homerun <- homerun_next %>% mutate(avg_re.homerun = avg_re.y - avg_re.x) %>%
+  select(pitch_id,  count_base_out_state_new, avg_re.homerun) %>% 
+  rename(count_base_out_state_homerun = count_base_out_state_new)
+
+
+
+hit_data_outcomes <- hit_data_outcomes %>%
+  left_join(hit_data_miss, by = "pitch_id") %>% 
+  left_join(hit_data_foul, by = "pitch_id") %>% 
+  left_join(hit_data_out, by = "pitch_id") %>% 
+  left_join(hit_data_single, by = "pitch_id") %>% 
+  left_join(hit_data_double, by = "pitch_id") %>% 
+  left_join(hit_data_triple, by = "pitch_id") %>% 
+  left_join(hit_data_homerun, by = "pitch_id")
+
+hit_data_outcomes <- hit_data_outcomes %>% 
+  mutate(avg_re.ball = ifelse(!is.na(on_1b) & !is.na(on_2b) & !is.na(on_3b) & balls == 3, avg_re.ball + 1, avg_re.ball)) %>% 
+  mutate(avg_re.single = ifelse(is.na(on_3b), avg_re.single, avg_re.single + 1)) %>% 
+  mutate(avg_re.double = ifelse(!is.na(on_3b) & !is.na(on_2b), avg_re.double + 2, ifelse(!is.na(on_3b) | !is.na(on_2b), avg_re.double + 1, avg_re.double))) %>% 
+  mutate(avg_re.triple = ifelse(!is.na(on_3b) & !is.na(on_2b) & !is.na(on_1b), avg_re.triple + 3, ifelse((!is.na(on_3b) & !is.na(on_2b)) | (!is.na(on_1b) & !is.na(on_2b)) | (!is.na(on_3b) & !is.na(on_1b)), avg_re.triple + 2, ifelse(!is.na(on_1b) | !is.na(on_2b) | !is.na(on_3b), avg_re.triple + 1, avg_re.triple)))) %>%
+  mutate(avg_re.homerun = ifelse(!is.na(on_3b) & !is.na(on_2b) & !is.na(on_1b), avg_re.triple + 4, ifelse((!is.na(on_3b) & !is.na(on_2b)) | (!is.na(on_1b) & !is.na(on_2b)) | (!is.na(on_3b) & !is.na(on_1b)), avg_re.triple + 3, ifelse(!is.na(on_1b) | !is.na(on_2b) | !is.na(on_3b), avg_re.homerun + 2, 1 + avg_re.homerun))))
+
+
+
+
+########
+hit_data_outcomes <- hit_data_outcomes %>% mutate(outcome = ifelse(description == "swinging_strike" | description == "swinging_strike_blocked" | description == "foul_tip" | (strikes == 2 & description == "foul_bunt") | description == "bunt_foul_tip" | description == "missed_bunt", "Miss", ifelse(description == "foul" | description == "foul_bunt", "Foul", ifelse(events == "single", "Single", ifelse(events == "double", "Double", ifelse(events == "triple", "Triple", ifelse(events == "home_run", "Homerun", "Out")))))))
+
+hit_data_outcomes <- hit_data_outcomes %>% filter(ERA <= 20)
+
+# ### APPLY DRE
+# dre_train <- hit_data_outcomes %>% select(balls, strikes, outs_when_up, on_1b, on_2b, on_3b, OPS, PA, change_re)
+# 
+# xgb.train_dre = xgb.DMatrix(data = as.matrix(dre_train[, -9]))
+# 
+# dre_preds <- predict(dre_mod, xgb.train_dre)
+# dre_preds <- as.data.frame(dre_preds)
+# 
+# hit_data_outcomes <- hit_data_outcomes %>% bind_cols(dre_preds)
+# 
+# hit_data_outcomes <- hit_data_outcomes %>% mutate(avg_re.ball = avg_re.ball + dre_preds, avg_re.strike = avg_re.strike + dre_preds, avg_re.miss = avg_re.miss + dre_preds, avg_re.foul = avg_re.foul + dre_preds)
+
+
+### APPLY RUN EXPECTANCY OF DECISION
+hit_data_outcomes <- hit_data_outcomes %>% mutate(re_take = avg_re.ball * (1 - strike_prob) + avg_re.strike * strike_prob)
+
+
+
+
+all_data <- hit_data_outcomes %>% select(plate_x, plate_z, pfx_x, pfx_z, pitch_type, balls, strikes, outs_when_up, release_spin_rate, stand, p_throws, effective_speed, release_speed, PA, BA, OBP, SLG, barrel_perc, avg_exit_velocity, avg_launch_angle, xAVG, xwOBA, wOBA, ISO, IP, ERA, GB.FB, WHIP, SO_perc, uBB_perc, overall_spin_rate, overall_velocity, outcome)
+
+
+all_lab <- as.factor(all_data$outcome)
+all_lab <- as.numeric(as.factor(all_lab))-1
+
+all_data$pitch_type <- as.numeric(as.factor(all_data$pitch_type)) - 1
+all_data$p_throws <- as.numeric(as.factor(all_data$p_throws)) - 1
+all_data$stand <- as.numeric(as.factor(all_data$stand)) - 1
+
+
+xgb.all = xgb.DMatrix(data = as.matrix(all_data[, -33]), label = all_lab)
+
+## Predict
+all.pred = predict(swing_mod, xgb.all, reshape=T)
+all.pred = as.data.frame(all.pred)
+names(all.pred) <- levels(all_data$outcome)
+all.pred$label <- all_data$outcome
+
+
+# Use the predicted label with the highest probability
+#all.pred$prediction = apply(all.pred,1,function(x) colnames(all.pred)[which.max(x)])
+colnames(all.pred)[1:7] <- final_lab
+
+
+hit_data_outcomes <- cbind(hit_data_outcomes, all.pred)
+
+
+
+
+
+# Calculate RE of a swing
+
+hit_data_outcomes <- hit_data_outcomes %>% mutate(re_swing = avg_re.miss * Miss + avg_re.foul * Foul + avg_re.out * Out + avg_re.single * Single + avg_re.double * Double + avg_re.triple * Triple + avg_re.homerun * Homerun)
+
+
+
+#Now create the stat to evaluate players on
+#Expected Runs Added by swinging
+
+hit_data_outcomes <- hit_data_outcomes %>% mutate(expRA_swing = re_swing - re_take, swing = ifelse(description == "ball" | description == "called_strike" | description == "blocked_ball" | description == "pitchout", 0, 1))
+
+hit_data_outcomes <- hit_data_outcomes %>% mutate(abs_eRA_s = abs(expRA_swing), should_swing = ifelse(re_swing > re_take, 1, 0), correct_choice = ifelse(should_swing == swing, 1, 0))
+
+hit_data_outcomes <- hit_data_outcomes %>% mutate(runs_lost_bad_dec = ifelse(correct_choice == 0, abs_eRA_s, 0))
+
+hit_data_outcomes
+}
+remove(dre_out_orig, dre_out_preds, dre_miss_orig, dre_miss_preds, dre_foul_orig, dre_foul_preds, dre_single_orig, dre_single_preds, dre_double_orig, dre_double_preds, dre_triple_orig, dre_triple_preds, dre_strike_orig, dre_strike_preds, dre_ball_orig, dre_ball_preds, dre_homerun_orig, dre_homerun_preds)
+
+hit_data_outcomes %>% filter(pitcher_name == "A.J. Minter") %>% select(pitcher_name, pitch_id, swing, expRA_swing, re_take, re_swing, avg_re.miss, Miss, avg_re.foul, Foul, avg_re.out, Out, avg_re.single, Single, avg_re.double, Double, avg_re.triple, Triple, avg_re.homerun, Homerun)
+
+hit_data_outcomes %>% filter(pitcher_name == "Jacob deGrom") %>% select(pitcher_name, pitch_id, swing, expRA_swing, re_take, re_swing, avg_re.miss, Miss, avg_re.foul, Foul, avg_re.out, Out, avg_re.single, Single, avg_re.double, Double, avg_re.triple, Triple, avg_re.homerun, Homerun)
+```
+
+
+
+Apply the EAGLE function to the data
+
+Only run if you would like to execute the functions in full, they take up a lot of memory. You can just load in the data below instead rather than running the functions.
+```{r, warning=F, eval=FALSE}
+remove(hit_data)
+remove(all_data)
+remove(hit_data_outcomes)
+remove(xgb_takes, xgb.test, xgb.train, xgb.train_dre, xgb.train_takes, test_lab, train_lab, sample, strike_prob_preds, takes_preds, train_takes, dre_preds, dre_train)
+remove(kZone, params, preds, strikezone_preds)
+remove(all.pred, ball_next, double_next, dre_ball_next, dre_foul_next, dre_miss_next, dre_strike_next, foul_next, hit_data_ball, hit_data_double, hit_data_foul, hit_data_homerun, hit_data_miss, hit_data_out, hit_data_single, hit_data_triple, homerun_next, miss_next, out_next, single_next, strike_next, takes, triple_next)
+
+data_2016 <- apply_EAGLE(pitches_2016, startdate = "2016-04-03", enddate = "2016-10-02")
+remove(pitches_2016)
+saveRDS(data_2016, "EAGLE_2016.rds")
+remove(data_2016)
+data_2017 <- apply_EAGLE(pitches_2017, startdate = "2017-04-02", enddate = "2017-10-01")
+remove(pitches_2017)
+saveRDS(data_2017, "EAGLE_2017.rds")
+remove(data_2017)
+data_2018 <- apply_EAGLE(pitches_2018, startdate = "2018-03-29", enddate = "2018-09-30")
+remove(pitches_2018)
+saveRDS(data_2018, "EAGLE_2018.rds")
+remove(data_2018)
+data_2019 <- apply_EAGLE(pitches_2019, startdate = "2019-03-20", enddate = "2019-09-29")
+remove(pitches_2019)
+saveRDS(data_2019, "EAGLE_2019.rds")
+remove(data_2019)
+data_2020 <- apply_EAGLE(pitches_2020, startdate = "2020-07-20", enddate = "2020-10-05")
+remove(pitches_2020)
+saveRDS(data_2020, "EAGLE_2020.rds")
+remove(data_2020)
+data_2021 <- apply_EAGLE(pitches_2021, startdate = "2021-03-20", enddate = "2021-10-05")
+remove(pitches_2021)
+saveRDS(data_2021, "EAGLE_2021.rds")
+remove(data_2021)
+remove(data_2016, data_2017, data_2018, data_2019, data_2020, data_2021)
+```
+
+Load in EAGLE RDS data directly rather than running the functions.
+```{r}
+
+data_2016 <- readRDS("EAGLE_2016.rds")
+data_2017 <- readRDS("EAGLE_2017.rds")
+data_2018 <- readRDS("EAGLE_2018.rds")
+data_2019 <- readRDS("EAGLE_2019.rds")
+data_2020 <- readRDS("EAGLE_2020.rds")
+data_2021 <- readRDS("EAGLE_2021.rds")
+
+
+
+```
+
+
+Create combined season data frame with commonly used metrics and EAGLE so that we have each hitter from 2016-2021
+```{r}
+eye_2016 <- data_2016 %>% filter(PA >= 200, !is.na(expRA_swing)) %>% group_by(batter, Name) %>% summarize(year = first(season.x), runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)), EAGLE = wRA / n(), avg = first(BA), obp = first(OBP), ops = first(OPS),  kperc = first(SO.x) / first(PA), bbperc = first(BB.x) / first(PA), perc_swing_out_zone = sum(ifelse(strike_prob < .3 & swing == 1, 1, 0)) / sum(ifelse(strike_prob < .3, 1, 0))) 
+
+eye_2017 <- data_2017 %>% filter(PA >= 200, !is.na(expRA_swing)) %>% group_by(batter, Name) %>% summarize(year = first(season.x), runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)), EAGLE = wRA / n(), avg = first(BA), obp = first(OBP), ops = first(OPS),  kperc = first(SO.x) / first(PA), bbperc = first(BB.x) / first(PA), perc_swing_out_zone = sum(ifelse(strike_prob < .3 & swing == 1, 1, 0)) / sum(ifelse(strike_prob < .3, 1, 0))) 
+
+eye_2018 <- data_2018 %>% filter(PA >= 200, !is.na(expRA_swing)) %>% group_by(batter, Name) %>% summarize(year = first(season.x), runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)), EAGLE = wRA / n(), avg = first(BA), obp = first(OBP), ops = first(OPS), kperc = first(SO.x) / first(PA), bbperc = first(BB.x) / first(PA), perc_swing_out_zone = sum(ifelse(strike_prob < .3 & swing == 1, 1, 0)) / sum(ifelse(strike_prob < .3, 1, 0))) 
+
+eye_2019 <- data_2019 %>% filter(PA >= 200, !is.na(expRA_swing)) %>% group_by(batter, Name) %>% summarize(year = first(season.x), runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)), EAGLE = wRA / n(), avg = first(BA), obp = first(OBP), ops = first(OPS), kperc = first(SO.x) / first(PA), bbperc = first(BB.x) / first(PA), perc_swing_out_zone = sum(ifelse(strike_prob < .3 & swing == 1, 1, 0)) / sum(ifelse(strike_prob < .3, 1, 0))) 
+
+eye_2020 <- data_2020 %>% filter(PA >= 150, !is.na(expRA_swing)) %>% group_by(batter, Name) %>% summarize(year = first(season.x), runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)), EAGLE = wRA / n(), avg = first(BA), obp = first(OBP), ops = first(OPS), kperc = first(SO.x) / first(PA), bbperc = first(BB.x) / first(PA), perc_swing_out_zone = sum(ifelse(strike_prob < .3 & swing == 1, 1, 0)) / sum(ifelse(strike_prob < .3, 1, 0))) 
+
+eye_2021 <- data_2021 %>% filter(PA >= 200, !is.na(expRA_swing)) %>% group_by(batter, Name) %>% summarize(year = first(season.x), runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)), EAGLE = wRA / n(), avg = first(BA), obp = first(OBP), ops = first(OPS), kperc = first(SO.x) / first(PA), bbperc = first(BB.x) / first(PA), perc_swing_out_zone = sum(ifelse(strike_prob < .3 & swing == 1, 1, 0)) / sum(ifelse(strike_prob < .3, 1, 0))) 
+
+
+eye_all <- eye_2016 %>% full_join(eye_2017, by = c("batter")) %>% full_join(eye_2018, by = c("batter")) %>% full_join(eye_2019, by = c("batter")) %>% full_join(eye_2020, by = c("batter")) %>% full_join(eye_2021, by = c("batter"))
+
+eye_all <- eye_all %>% rename(wRL_2016 = runs_lost.x, wRL_2017 = runs_lost.y, wRL_2018 = runs_lost.x.x, wRL_2019 = runs_lost.y.y, wRL_2020 = runs_lost.x.x.x, wRL_2021 = runs_lost.y.y.y)
+
+```
+
+
+Create data frame containing player stats from consecutive years so that we can see predictabililty and correlation across years
+```{r}
+eye_this_next1 <- eye_2016 %>% left_join(eye_2017, by = c("batter", "Name")) 
+eye_this_next2 <- eye_2017 %>% left_join(eye_2018, by = c("batter", "Name"))
+eye_this_next3 <- eye_2018 %>% left_join(eye_2019, by = c("batter", "Name"))
+
+eye_this_next <- bind_rows(eye_this_next1, eye_this_next2, eye_this_next3)
+
+remove(eye_this_next1, eye_this_next2, eye_this_next3)
+
+```
+
+
+Look at results of outcome probabilities xgboost model
+```{r}
+all_years <- rbind(data_2016, data_2017, data_2018, data_2019, data_2020, data_2021)
+
+levs = c("Miss", "Foul", "Out", "Single", "Double", "Triple", "Homerun")
+
+all_years %>% 
+  filter(!is.na(outcome)) %>% 
+  group_by(outcome) %>% 
+  summarize(Miss = mean(Miss, na.rm = T), 
+            Foul = mean(Foul, na.rm = T), 
+            Out = mean(Out, na.rm = T), 
+            Single = mean(Single, na.rm = T), 
+            Double = mean(Double, na.rm = T), 
+            Triple = mean(Triple, na.rm = T), 
+            Homerun = mean(Homerun, na.rm = T)) %>% 
+  mutate(outcome =  factor(outcome, levels = levs)) %>%
+  arrange(outcome)
+
+```
+
+
+Run linear regression models in order to test for significant relationships between EAGLE and other significant statistics
+```{r}
+
+####
+# Test EAGLE correlation from year to year
+eye_this_next_mod <- lm(EAGLE.y ~ EAGLE.x, data = eye_this_next)
+summary(eye_this_next_mod)
+
+####
+
+# Test with AVG
+ba_eye_mod <- lm(avg.x ~ EAGLE.x, data = eye_this_next)
+summary(ba_eye_mod)
+
+next_ba_eye_mod <- lm(avg.y ~ EAGLE.x, eye_this_next)
+summary(next_ba_eye_mod)
+
+both_ba_eye_mod <- lm(avg.y ~ EAGLE.x + avg.x, eye_this_next)
+summary(both_ba_eye_mod)
+
+# Test for OBP
+obp_eye_mod <- lm(obp.x ~ EAGLE.x, data = eye_this_next)
+summary(obp_eye_mod)
+
+next_obp_eye_mod <- lm(obp.y ~ EAGLE.x, eye_this_next)
+summary(next_obp_eye_mod)
+
+both_obp_eye_mod <- lm(obp.y ~ EAGLE.x + obp.x, eye_this_next)
+summary(both_obp_eye_mod)
+
+# Now for OPS
+ops_eye_mod <- lm(ops.x ~ EAGLE.x, data = eye_this_next)
+summary(ops_eye_mod)
+
+next_ops_eye_mod <- lm(ops.y ~ EAGLE.x, eye_this_next)
+summary(next_ops_eye_mod)
+
+ops_ops_eye_mod <- lm(ops.y ~ ops.x, eye_this_next)
+summary(ops_ops_eye_mod)
+
+both_ops_eye_mod <- lm(ops.y ~ EAGLE.x + ops.x, eye_this_next)
+summary(both_ops_eye_mod)
+
+###
+```
+
+
+#Create graphs for important relationships
+
+First create graph for walk percentage while also testing the relationship with a linear regression model
+```{r}
+eye_this_next %>% filter(EAGLE.x >= 0) %>% ggplot(aes(x = EAGLE.x, y = bbperc.x)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and BB%", 
+       subtitle = "2016-2021") +
+  xlab("EAGLE") +
+  ylab("BB%")
+
+bbperc_mod <- lm(bbperc.x ~ EAGLE.x, data = eye_this_next)
+summary(bbperc_mod)
+
+```
+
+Graph for relationship with O% and also test it with a linear regression model
+```{r}
+eye_this_next %>% filter(EAGLE.x >= 0 & perc_swing_out_zone.x < .8) %>% ggplot(aes(x = EAGLE.x, y = perc_swing_out_zone.x)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and O%", 
+       subtitle = "2016-2021") +
+  xlab("EAGLE") +
+  ylab("O%")
+
+operc_mod <- lm(perc_swing_out_zone.x ~ EAGLE.x, data = eye_this_next)
+summary(operc_mod)
+```
+
+
+Create graph for relationship of EAGLE with OBP
+```{r}
+eye_this_next %>% 
+  filter(!is.na(EAGLE.x), !is.na(obp.x), EAGLE.x >= .025) %>% 
+  ggplot(aes(EAGLE.x, obp.x)) + 
+  geom_point() + 
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  ggtitle("Correlation to OBP") + 
+  xlab("EAGLE") + 
+  ylab("OBP")
+
+```
+
+
+Create graph to highlight the correlation of EAGLE from year to year
+```{r}
+eye_this_next %>% filter(EAGLE.x >= 0) %>% ggplot(aes(x = EAGLE.x, y = EAGLE.y)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLEs from year to year", 
+       subtitle = "2016-2021") +
+  xlab("EAGLE 1") +
+  ylab("EAGLE 2")
+
+```
+
+Create graphs showing the relationship of EAGLE with the current year's OPS and with the next year's OPS
+```{r}
+eye_this_next %>% filter(EAGLE.x >= 0) %>% ggplot(aes(x = EAGLE.x, y = ops.x)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and OPS", 
+       subtitle = "2016-2021") +
+  xlab("EAGLE") +
+  ylab("OPS")
+
+eye_this_next %>% filter(EAGLE.x >= 0) %>% ggplot(aes(x = EAGLE.x, y = ops.y)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and Next Year's OPS", 
+       subtitle = "2016-2019") +
+  xlab("EAGLE") +
+  ylab("Next Year's OPS")
+```
+
+
+Bring the data of all the years together to calculate predictions from percentiles in addition to testing correlation. Also check out who is the best/worst in EAGLE
+```{r}
+
+all_eye <- all_years %>% 
+  mutate(season.x = as.numeric(season.x)) %>% 
+  filter(PA >= 300, !is.na(expRA_swing)) %>% 
+  group_by(Name, season.x) %>% 
+  summarize(runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), 
+            wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)),
+            ba = first(BA),
+            obp = first(OBP),
+            slg = first(SLG),
+            ops = first(OPS),
+            pitches = n(),
+            bb_perc = first(BB.x) / first(PA),
+            o_perc = sum(ifelse(strike_prob < .5 & swing == 1, 1, 0), na.rm = T) / sum(ifelse(strike_prob < .5, 1, 0), na.rm = T)) %>% 
+  mutate(EAGLE = wRA / pitches)
+
+all_eye %>% select(Name, season.x, EAGLE, bb_perc, o_perc) %>% arrange(-EAGLE) %>% head(30)
+all_eye %>% select(Name, season.x, EAGLE, bb_perc, o_perc) %>% arrange(EAGLE) %>% head(10)
+
+eagle_perc <- quantile(all_eye$EAGLE, probs = c(.1, .25, .75, .9))
+percentiles <- data_frame(percentile = c("10th percentile", "25th percentile", "75th percentile", "90th percentile"), EAGLE.x = eagle_perc)
+percentiles %>% add_predictions(ops_eye_mod, var = "OPS")
+percentiles %>% add_predictions(next_ops_eye_mod, var = "Next_OPS")
+
+all_eye %>% ggplot(aes(EAGLE)) + geom_density()
+
+cor(all_eye$EAGLE, all_eye$ops)
+
+cor(all_eye$o_perc, all_eye$ops)
+```
+
+Current Year EAGLE correlated with current year statistics and next year's EAGLE
+```{r}
+eye_this_next %>% 
+  ungroup() %>% 
+  select(EAGLE.x, avg.x, obp.x, ops.x, kperc.x, bbperc.x, perc_swing_out_zone.x, EAGLE.y) %>% 
+  rename(o_perc = perc_swing_out_zone.x, EAGLE_cur_year = EAGLE.x, EAGLE_next_year = EAGLE.y) %>% 
+  cor(use = "complete.obs")
+
+```
+
+
+Inverse EAGLE, look at EAGLE for pitchers. Who is the most deceptive/good at getting batters to make the wrong decision by swinging at bad pitches or taking good pitches
+```{r}
+all_pitchers_eye <- all_years %>% 
+  mutate(season.x = as.numeric(season.x)) %>% 
+  filter(IP >= 20, !is.na(expRA_swing)) %>% 
+  group_by(pitcher_name, season.x) %>% 
+  summarize(runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), 
+            wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)),
+            IP = first(IP),
+            ERA = first(ERA),
+            K_perc= first(SO_perc),
+            BB_perc = first(uBB_perc),
+            xwOBA = mean(estimated_woba_using_speedangle, na.rm = T),
+            pitches = n(),
+            o_perc = sum(ifelse(strike_prob < .5 & swing == 1, 1, 0), na.rm = T) / sum(ifelse(strike_prob < .5, 1, 0), na.rm = T)) %>% 
+  mutate(EAGLE = wRA / pitches)
+
+all_pitchers_eye %>% select(pitcher_name, season.x, EAGLE, IP, ERA, K_perc, BB_perc, o_perc) %>% filter(IP >= 90 | IP >= 40 & season.x == 2020) %>% arrange(EAGLE)
+
+all_pitchers_eye %>% select(pitcher_name, season.x, EAGLE, IP, ERA, K_perc, BB_perc, o_perc) %>% filter(IP >= 40 & IP <= 85 & season.x != 2020 | IP <= 35 & season.x == 2020) %>% arrange(EAGLE)
+
+
+
+```
+
+
+Check out the relationship of pitching EAGLE with other common pitcher metrics.
+```{r}
+all_pitchers_eye %>% 
+  filter(IP >= 50) %>% 
+  ggplot(aes(x = EAGLE, y = ERA)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between Inverse EAGLE and ERA", 
+       subtitle = "2016-2021 (min. 40 IP)") +
+  xlab("EAGLE") +
+  ylab("ERA")
+
+
+qualified_pitchers <- all_pitchers_eye %>% filter(IP >= 50)
+
+ERA_mod <- lm(ERA ~ EAGLE, data = qualified_pitchers)
+summary(ERA_mod)
+```
+
+
+```{r}
+all_pitchers_eye %>% filter(IP >= 50) %>% ggplot(aes(x = EAGLE, y = K_perc)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and K%", 
+       subtitle = "2016-2019") +
+  xlab("EAGLE") +
+  ylab("K%")
+
+k_perc_mod <- lm(K_perc ~ EAGLE, data = qualified_pitchers)
+summary(k_perc_mod)
+```
+
+
+```{r}
+
+
+all_pitchers_eye%>% filter(IP >= 50) %>% ggplot(aes(x = EAGLE, y = BB_perc)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and BB%", 
+       subtitle = "2016-2019") +
+  xlab("EAGLE") +
+  ylab("BB%")
+```
+
+
+```{r}
+all_pitchers_eye%>% filter(IP >= 50) %>% ggplot(aes(x = EAGLE, y = o_perc)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and O%", 
+       subtitle = "2016-2019") +
+  xlab("EAGLE") +
+  ylab("O%")
+
+```
+
+
+```{r}
+
+all_pitchers_eye%>% filter(IP >= 50) %>% ggplot(aes(x = EAGLE, y = xwOBA)) + 
+  geom_point() +
+  stat_smooth(method = "lm") + 
+  theme_gdocs() + 
+  labs(title = "Relationship between EAGLE and xwOBA", 
+       subtitle = "2016-2019") +
+  xlab("EAGLE") +
+  ylab("xwOBA")
+
+```
+
+
+```{r}
+all_pitchers_eye <-  data_2019 %>%
+  mutate(season.x = as.numeric(season.x)) %>% 
+  filter(IP >= 50, !is.na(expRA_swing)) %>% 
+  group_by(pitcher_name, season.x) %>% 
+  summarize(runs_lost = sum(runs_lost_bad_dec) / sum(abs_eRA_s), 
+            wRA = sum(ifelse(swing == 1, expRA_swing, -expRA_swing)),
+            IP = first(IP),
+            ERA = first(ERA),
+            K_perc= first(SO_perc),
+            BB_perc = first(uBB_perc),
+            pitches = n(),
+            TB = (first(X1B.y) + 2 * first(X2B.y) + 3 * first(X3B.y) + 4 * first(HR.y)) / first(AB.y),
+            o_perc = sum(ifelse(strike_prob < .5 & swing == 1, 1, 0), na.rm = T) / sum(ifelse(strike_prob < .5, 1, 0), na.rm = T)) %>% 
+  mutate(EAGLE = wRA / pitches)
+
+all_pitchers_eye %>% select(pitcher_name, season.x, EAGLE, IP, ERA, TB, K_perc, BB_perc, o_perc) %>% arrange(EAGLE)
+```
+
+
+
